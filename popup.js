@@ -112,7 +112,7 @@
 
     const domain = getRegisteredDomain(new URL(tabUrl).hostname);
 
-    const [httpResult, headResp, sslData, hstsPreloadData] = await Promise.all([
+    const [httpResult, headResp, cryptCheckData, hstsPreloadData] = await Promise.all([
       // HTTP protocol version from content script
       api.scripting.executeScript({
         target: { tabId },
@@ -125,11 +125,8 @@
       // HSTS + Expect-CT from HEAD response
       fetch(tabUrl, { method: 'HEAD' }).catch(() => null),
 
-      // SSL Labs cached TLS data (4s timeout)
-      fetchWithTimeout(
-        `https://api.ssllabs.com/api/v3/analyze?host=${domain}&fromCache=on&all=done`,
-        4000
-      ).then(r => r.ok ? r.json() : null).catch(() => null),
+      // CryptCheck TLS data via background
+      fetchCryptCheck(domain),
 
       // HSTS Preload list status (4s timeout)
       fetchWithTimeout(
@@ -153,98 +150,166 @@
 
     // HSTS Preload list
     if (hstsPreloadData) {
-      result.hstsPreload = hstsPreloadData.status || null; // 'preloaded' | 'pending' | 'unknown'
+      result.hstsPreload = hstsPreloadData.status || null;
     }
 
-    // SSL Labs
-    if (sslData && sslData.status === 'READY') {
-      // Endpoint TLS details
-      if (sslData.endpoints) {
-        const ep = sslData.endpoints.find(e => e.grade) || sslData.endpoints[0];
-        if (ep) {
-          result.grade = ep.grade || null;
-          const details = ep.details;
-          if (details) {
-            if (details.protocols) {
-              result.tlsVersions = details.protocols
-                .filter(p => p.name === 'TLS')
-                .map(p => p.version)
-                .sort()
-                .reverse();
-              // Detect deprecated protocols (TLS 1.0 / 1.1)
-              result.weakProtocols = details.protocols
-                .filter(p => p.name === 'TLS' && (p.version === '1.0' || p.version === '1.1'))
-                .map(p => `TLS ${p.version}`);
-            }
-            if (details.suites) {
-              const sorted = [...details.suites].sort((a, b) => (b.protocol || 0) - (a.protocol || 0));
-              for (const suite of sorted) {
-                if (suite.list && suite.list.length > 0) {
-                  result.cipher = suite.list[0].name;
-                  result.cipherStrength = suite.list[0].cipherStrength;
-                  break;
-                }
-              }
-            }
-            // Forward Secrecy (0=none, 1=some browsers, 2=all browsers, 4=all+SCSV)
-            if (details.forwardSecrecy !== undefined) {
-              result.forwardSecrecy = details.forwardSecrecy;
-            }
-            // OCSP Stapling
-            if (details.ocspStapling !== undefined) {
-              result.ocspStapling = details.ocspStapling;
-            }
-            // PQC (Post-Quantum Cryptography) key exchange detection
-            if (details.namedGroups) {
-              // NIST PQC finalists / hybrids: ML-KEM (Kyber), NTRU, SABER, BIKE, HQC
-              const PQC_PATTERNS = ['MLKEM', 'KYBER', 'NTRU', 'SABER', 'BIKE', 'HQC'];
-              result.pqcKeyExchange = details.namedGroups
-                .filter(g => g.name && PQC_PATTERNS.some(p => g.name.toUpperCase().includes(p)))
-                .map(g => g.name);
-              result.allNamedGroups = details.namedGroups
-                .map(g => g.name || null).filter(Boolean);
-            }
-            // Vulnerability detection from SSL Labs data
-            result.vulns = [];
-            if (details.heartbleed) result.vulns.push('Heartbleed');
-            if (details.poodle) result.vulns.push('POODLE (SSL 3.0)');
-            if (details.poodleTls >= 2) result.vulns.push('POODLE TLS');
-            if (details.beast) result.vulns.push('BEAST');
-            if (details.lucky13 === 2) result.vulns.push('Lucky13');
-            if (details.robot >= 3) result.vulns.push('ROBOT');
-            if (details.freak) result.vulns.push('FREAK');
+    // CryptCheck TLS data — response: { result: [{ grade, states, handshakes: { protocols, ciphers, certs, fallback_scsv, ... } }] }
+    const host = cryptCheckData?.result?.[0];
+    if (host) {
+      const hs = host.handshakes || {};
+
+      // Grade
+      result.grade = host.grade || null;
+
+      // TLS versions from handshakes.protocols[]
+      if (Array.isArray(hs.protocols)) {
+        const protocols = new Set();
+        for (const p of hs.protocols) {
+          if (p.protocol) {
+            // "TLSv1_2" → "1.2", "TLSv1_3" → "1.3"
+            const ver = p.protocol.replace(/^TLSv?/i, '').replace(/_/g, '.');
+            if (ver) protocols.add(ver);
           }
+        }
+        result.tlsVersions = [...protocols].sort().reverse();
+
+        // Deprecated protocols
+        const weak = [];
+        for (const v of result.tlsVersions) {
+          if (v === '1.0') weak.push('TLS 1.0');
+          if (v === '1.1') weak.push('TLS 1.1');
+        }
+        result.weakProtocols = weak;
+      }
+
+      // Cipher suite (best cipher from handshakes.ciphers[])
+      const ciphers = hs.ciphers || [];
+      if (ciphers.length > 0) {
+        const best = ciphers[0];
+        result.cipher = best.name || null;
+        if (best.hmac?.size) {
+          result.cipherStrength = best.hmac.size;
         }
       }
 
-      // Certificate info (leaf cert + intermediate chain)
-      if (sslData.certs && sslData.certs.length > 0) {
-        const leaf = sslData.certs[0];
+      // Forward Secrecy — check key_exchange across all ciphers
+      if (ciphers.length > 0) {
+        const kexTypes = ciphers
+          .map(c => c.key_exchange)
+          .filter(Boolean);
+        const pfsKex = kexTypes.filter(k => /ecdh|dhe/i.test(k));
+        if (kexTypes.length === 0 || pfsKex.length === 0) {
+          result.forwardSecrecy = 0;
+        } else if (pfsKex.length < kexTypes.length) {
+          result.forwardSecrecy = 1;
+        } else {
+          // All PFS; check for fallback SCSV
+          result.forwardSecrecy = hs.fallback_scsv ? 4 : 2;
+        }
+      }
+
+      // Vulnerability detection from CryptCheck states
+      result.vulns = [];
+      if (host.states) {
+        const crit = host.states.critical || {};
+        if (crit.sslv3) result.vulns.push('POODLE (SSL 3.0)');
+        if (crit.export) result.vulns.push('FREAK');
+        if (crit.sweet32) result.vulns.push('Sweet32');
+        if (crit.rc4) result.vulns.push('RC4');
+        if (crit.des) result.vulns.push('DES');
+        if (crit.null) result.vulns.push('NULL暗号');
+        if (crit.anonymous) result.vulns.push('Anonymous Cipher');
+        if (crit.sha1_sign) result.vulns.push('SHA-1署名');
+        if (crit.sslv2) result.vulns.push('SSLv2');
+      }
+
+      // Certificate info from CryptCheck (handshakes.certs[0])
+      const certs = hs.certs || [];
+      if (certs.length > 0) {
+        const leaf = certs[0];
+        const keyType = (leaf.key?.type || '').toLowerCase();
+        const keyAlgMap = { 'ecc': 'ECDSA', 'rsa': 'RSA', 'dsa': 'DSA' };
+        const keyAlg = keyAlgMap[keyType] || leaf.key?.type || null;
+        const keyCurve = leaf.key?.curve || null;
         result.cert = {
           subject: leaf.subject || null,
-          issuer: leaf.issuerSubject || null,
-          sigAlg: leaf.sigAlg || null,
-          keyAlg: leaf.keyAlg || null,
-          keySize: leaf.keySize || null,
-          notBefore: leaf.notBefore || null,
-          notAfter: leaf.notAfter || null,
-          altNames: leaf.altNames || null,
-          chain: sslData.certs.slice(1).map(c => ({
-            subject: c.subject || null,
-            issuer: c.issuerSubject || null
-          }))
+          issuer: leaf.issuer || null,
+          sigAlg: null, // not available from CryptCheck
+          keyAlg,
+          keySize: leaf.key?.size || null,
+          keyCurve,
+          notBefore: leaf.lifetime?.not_before ? Date.parse(leaf.lifetime.not_before) : null,
+          notAfter: leaf.lifetime?.not_after ? Date.parse(leaf.lifetime.not_after) : null,
+          altNames: null, // not available from CryptCheck; merged from certspotter later
+          chain: Array.isArray(leaf.chain)
+            ? leaf.chain.map(c => ({
+                subject: c.subject || null,
+                issuer: c.issuer || null
+              }))
+            : []
         };
-        // PQC certificate signature algorithm (ML-DSA / SLH-DSA / Falcon / Dilithium / SPHINCS+)
-        const sigAlg = leaf.sigAlg || '';
-        result.pqcCertSig = /ML-DSA|SLH-DSA|Falcon|Dilithium|SPHINCS/i.test(sigAlg);
+        // PQC certificate — check key type for PQC algorithms
+        result.pqcCertSig = false;
       }
+
+      // PQC key exchange — CryptCheck does not provide named groups
+      result.pqcKeyExchange = [];
+      result.allNamedGroups = [];
     }
 
     return result;
   }
 
+  /**
+   * Fetch certificate info from Certificate Transparency logs (certspotter).
+   * This API supports CORS and works reliably from browser extensions.
+   */
+  async function checkCertFromCT(tabUrl) {
+    const isHttps = tabUrl.startsWith('https://');
+    if (!isHttps) return null;
+
+    const hostname = new URL(tabUrl).hostname.replace(/^www\./, '');
+    const url = `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(hostname)}`
+      + `&include_subdomains=false&expand=issuer&expand=dns_names`;
+    const resp = await fetchWithTimeout(url, 6000);
+    if (!resp.ok) return null;
+    const entries = await resp.json();
+    if (!Array.isArray(entries) || entries.length === 0) return null;
+
+    // Most recent certificate is the last entry (sorted by issuance time)
+    const latest = entries[entries.length - 1];
+    return {
+      subject: null,
+      issuer: latest.issuer?.friendly_name || latest.issuer?.name || null,
+      sigAlg: null,
+      keyAlg: null,
+      keySize: null,
+      notBefore: latest.not_before ? Date.parse(latest.not_before) : null,
+      notAfter: latest.not_after ? Date.parse(latest.not_after) : null,
+      altNames: Array.isArray(latest.dns_names) ? latest.dns_names : null,
+      chain: []
+    };
+  }
+
   function fetchWithTimeout(url, ms) {
     return fetch(url, { signal: AbortSignal.timeout(ms) });
+  }
+
+  /**
+   * Fetch CryptCheck TLS data via background service worker.
+   * Proxied through background for transparent redirect handling
+   * (tls.imirhil.fr → cryptcheck.fr).
+   */
+  async function fetchCryptCheck(domain) {
+    try {
+      const result = await api.runtime.sendMessage({
+        type: 'FETCH_CRYPTCHECK',
+        domain
+      });
+      return result?.data || null;
+    } catch {
+      return null;
+    }
   }
 
   // ─── Shared UI helpers ───
@@ -472,9 +537,10 @@
 
     // Key & signature
     if (cert.keyAlg) {
-      const keyDetail = cert.keySize
+      let keyDetail = cert.keySize
         ? `${cert.keyAlg} ${cert.keySize}-bit`
         : cert.keyAlg;
+      if (cert.keyCurve) keyDetail += ` (${cert.keyCurve})`;
       content.appendChild(createInfoRow('neutral', '鍵', keyDetail));
     }
     if (cert.sigAlg) {
@@ -530,7 +596,7 @@
     content.innerHTML = '';
 
     if (data.vulns.length === 0) {
-      content.appendChild(createInfoRow('pass', 'SSL Labs スキャン', '脆弱性は検出されませんでした'));
+      content.appendChild(createInfoRow('pass', 'TLS スキャン', '検出可能な脆弱性はありません'));
       return;
     }
 
@@ -543,7 +609,7 @@
     const section = document.getElementById('pqc-section');
     const content = document.getElementById('pqc-content');
 
-    // Show section only if SSL Labs data was available (pqcKeyExchange is set)
+    // Show section only if TLS scan data was available (pqcKeyExchange is set)
     if (!data || data.pqcKeyExchange === undefined) {
       section.hidden = true;
       return;
@@ -1340,9 +1406,10 @@
       }
 
       // Run all checks in parallel
-      const [response, encryption, secHeaders, cookies, emailAuth, dnsSec, dnsInfo, pageSec, publicFiles, vtResult] = await Promise.all([
+      const [response, encryption, ctCert, secHeaders, cookies, emailAuth, dnsSec, dnsInfo, pageSec, publicFiles, vtResult] = await Promise.all([
         api.runtime.sendMessage({ type: 'RUN_DETECTION', tabId, url: tabUrl }),
         checkEncryption(tabId, tabUrl).catch(() => null),
+        checkCertFromCT(tabUrl).catch(() => null),
         checkSecurityHeaders(tabUrl).catch(() => null),
         checkCookies(tabUrl).catch(() => null),
         checkEmailAuth(tabUrl).catch(() => null),
@@ -1363,7 +1430,20 @@
       }
 
       renderEncryption(encryption);
-      renderCert(encryption?.cert || null);
+      // Merge CryptCheck cert (subject DN, key, issuer DN, chain) with certspotter (SANs, validity, issuer)
+      let mergedCert = null;
+      if (encryption?.cert) {
+        mergedCert = { ...encryption.cert };
+        if (ctCert) {
+          if (!mergedCert.altNames && ctCert.altNames) mergedCert.altNames = ctCert.altNames;
+          if (!mergedCert.notBefore && ctCert.notBefore) mergedCert.notBefore = ctCert.notBefore;
+          if (!mergedCert.notAfter && ctCert.notAfter) mergedCert.notAfter = ctCert.notAfter;
+          if (!mergedCert.sigAlg && ctCert.sigAlg) mergedCert.sigAlg = ctCert.sigAlg;
+        }
+      } else {
+        mergedCert = ctCert || null;
+      }
+      renderCert(mergedCert);
       renderVulnerabilities(encryption);
       renderPqc(encryption);
       renderSecurityHeaders(secHeaders);

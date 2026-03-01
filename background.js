@@ -166,6 +166,22 @@
     });
   }
 
+  /**
+   * Fetch CryptCheck TLS data from background service worker.
+   * CryptCheck redirects tls.imirhil.fr → cryptcheck.fr; fetch() follows this transparently.
+   */
+  async function fetchCryptCheckData(domain) {
+    const url = `https://tls.imirhil.fr/https/${encodeURIComponent(domain)}.json`;
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (!resp.ok) return { data: null };
+      const data = await resp.json();
+      return { data };
+    } catch {
+      return { data: null };
+    }
+  }
+
   // Listen for messages
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Content script detection results
@@ -200,6 +216,14 @@
         sendResponse(result);
       }).catch(() => {
         sendResponse({ url: message.url || '', detections: [] });
+      });
+      return true; // async sendResponse
+    }
+
+    // CryptCheck API fetch (proxied from popup for redirect handling)
+    if (message.type === 'FETCH_CRYPTCHECK') {
+      fetchCryptCheckData(message.domain).then(result => {
+        sendResponse(result);
       });
       return true; // async sendResponse
     }
